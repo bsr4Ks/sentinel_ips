@@ -1,0 +1,4 @@
+venv
+.env
+sentinel_hits.db
+test_logs
