@@ -4,7 +4,6 @@ import time
 import json
 import sqlite3
 import subprocess
-from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
 from watchdog.observers import Observer
@@ -12,15 +11,16 @@ from watchdog.events import FileSystemEventHandler
 
 class SentinelHandler(FileSystemEventHandler):
     def __init__(self, log_path, db_path):
+        load_dotenv()
         self.whitelist = os.getenv("WHITELIST_IP", "").split(",")
         self.log_path = log_path
         self.db_path = db_path
         self.last_positions = {}
+        self.already_banned = set() 
         self.init_db()
         super().__init__()
 
     def init_db(self):
-        """SQLite veritabanını ve saldırı kayıt tablosunu hazırlar."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('''
@@ -37,16 +37,15 @@ class SentinelHandler(FileSystemEventHandler):
         conn.close()
 
     def ban_attacker(self, ip):
-        """IP'yi Linux çekirdek seviyesinde (iptables) bloklar."""
+        """IP'yi listenin EN BAŞINA ekleyerek çekirdek seviyesinde bloklar."""
         try:
-            # Mükerrer banı önlemek için kontrol (Opsiyonel: iptables -C ile bakılabilir)
-            subprocess.run(["sudo", "iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"], check=True)
-            print(f"🛡️  [ACTION] {ip} çekirdek seviyesinde engellendi.")
+            # MÜHENDİSLİK DOKUNUŞU 2: -I kullanarak hiyerarşi sorununu çözüyoruz
+            subprocess.run(["sudo", "iptables", "-I", "INPUT", "1", "-s", ip, "-j", "DROP"], check=True)
+            print(f"🛡️  [ACTION] {ip} listenin başına eklendi ve bloklandı.")
         except Exception as e:
             print(f"❌ Ban Hatası ({ip}): {e}")
 
     def save_to_db(self, ip, event_id, reason, log_line):
-        """Saldırı verisini kalıcı olarak veritabanına mühürler."""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -66,19 +65,15 @@ class SentinelHandler(FileSystemEventHandler):
     def process_new_data(self, file_path):
         current_size = os.path.getsize(file_path)
         last_pos = self.last_positions.get(file_path, 0)
-
-        if current_size < last_pos:
-            last_pos = 0 # Log rotation tespiti
+        if current_size < last_pos: last_pos = 0
 
         try:
             with open(file_path, "r", encoding="utf-8") as f:
                 f.seek(last_pos)
                 new_lines = f.readlines()
-                
                 for line in new_lines:
                     if line.strip():
                         self.analyze_threat(line.strip())
-                
                 self.last_positions[file_path] = f.tell()
         except Exception as e:
             print(f"[!] Okuma hatası: {e}")
@@ -89,7 +84,10 @@ class SentinelHandler(FileSystemEventHandler):
             ip = data.get("src_ip")
             event_id = data.get("eventid")
             
-            # Tehdit kriterleri: Bendi.py yükleme veya başarısız giriş
+            # MÜHENDİSLİK DOKUNUŞU 3: Gereksiz işlem yükünü önle
+            if not ip or ip in self.already_banned:
+                return
+
             reason = ""
             if "bendi.py" in str(data):
                 reason = "Malware Upload (bendi.py)"
@@ -98,17 +96,18 @@ class SentinelHandler(FileSystemEventHandler):
 
             if reason:
                 if ip in self.whitelist:
-                    print(f"[-] Whitelisted IP detected ({ip}), skipping ban.")
+                    print(f"[-] Whitelist IP detected ({ip}), skipping.")
                     return
+                
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ Threat: {ip} | Reason: {reason}")
                 self.ban_attacker(ip)
                 self.save_to_db(ip, event_id, reason, log_line)
+                self.already_banned.add(ip) # Hafızaya mühürle
         except:
             pass
 
 def main():
     load_dotenv()
-    # Frankfurt sunucun için /var/lib/docker/volumes/... yolu
     path = os.getenv("PATH_PROD") if os.getenv("IS_PROD") == "True" else os.getenv("PATH_TEST")
     db_name = "sentinel_hits.db"
 
@@ -116,7 +115,7 @@ def main():
         print(f"❌ Error: Path {path} not found!")
         sys.exit(1)
 
-    print(f"🚀 Sentinel-IPS Enforcer Started")
+    print(f"🚀 Sentinel-IPS Enforcer v2.0 Started")
     print(f"📍 Monitoring: {path}")
     print(f"💾 Database: {os.path.abspath(db_name)}\n" + "-"*40)
 
